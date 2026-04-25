@@ -1,6 +1,6 @@
 How to use:
 
-If you already have a blender screne, load and run the "create_hogel_lightfield_rig.py" script to add the hogel images rendering rig into the scene.  If you don't have a scene, load and run "create_rubiks_cube.py" to create one.  
+If you already have a blender scene, load and run the "create_hogel_lightfield_rig.py" script to add the hogel images rendering rig into the scene.  If you don't have a scene, load and run "create_rubiks_cube.py" to create one.  
 
 You may want to take a look at hogel_params.py and adapt it to your setup.
 

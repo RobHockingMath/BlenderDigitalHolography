@@ -8,3 +8,5 @@ Then, load and run the render_hogels_from_rig.py script to start rendering hogel
 to just look at the folder "hogel_renders" that the images are being written to.  Periodically check how many files are in it (there will be one per hogel, so compute ahead of time how many hogels you have).  
 
 You can then preview what your hologram should look like by running from the terminal "python hologram_lightfield_viewer.py".  Run "pip install pygame moderngl pillow numpy" from the terminal to make sure you have everything.
+
+IN ITS CURRENT FORM, THIS ONLY WORKS IF THE ENTIRE SCENE IS BEHIND THE HOLOGRAM PLANE.

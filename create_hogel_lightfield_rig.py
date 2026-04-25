@@ -213,7 +213,7 @@ def create_hogel_camera(collection, inward_normal, fov_degrees):
     cam_data.angle = math.radians(fov_degrees)
     cam_data.clip_start = 0.001
     cam_data.clip_end = 1000.0
-    cam_data.display_size = 0.2
+    cam_data.display_size = 2.0
 
     cam = bpy.data.objects.new(params.CAMERA_OBJECT_NAME, cam_data)
     link_to_collection(cam, collection)

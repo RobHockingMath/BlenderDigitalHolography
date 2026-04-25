@@ -19,7 +19,7 @@ create_hogel_lightfield_rig.py stores in the Blender collection.
 # Hologram plane center.
 # Plane lies in the XZ plane at fixed y = Y0 before any viewer-side rotation.
 X0 = 0.0
-Y0 = -3.0
+Y0 = -1.5
 Z0 = 0.0
 
 # Requested screen dimensions.
@@ -35,7 +35,7 @@ H = 6.0
 # and the actual sampled size is:
 #   W_sampled = Na * h
 #   H_sampled = Nb * h
-h = 0.1
+h = 0.05
 
 # Direction from hologram plane into the scene.
 # Current convention: screen at y=-3, object near origin, so inward is +Y.

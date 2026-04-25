@@ -24,6 +24,43 @@ OUTPUT_DIR = "//hogel_renders"
 # False is better while testing because it overwrites stale renders.
 SKIP_EXISTING = False
 
+# ============================================================
+# VISUAL DEBUG SETTINGS
+# ============================================================
+
+# If True, make the moving camera much easier to see inside Blender while rendering.
+# This is for debugging / demonstration, not maximum performance.
+VISUAL_DEBUG = True
+
+# Make the camera icon larger and easier to see.
+VISUAL_DEBUG_CAMERA_DISPLAY_SIZE = 1.0
+
+# Show the camera name and draw it in front of other objects.
+VISUAL_DEBUG_SHOW_CAMERA_NAME = True
+VISUAL_DEBUG_SHOW_CAMERA_IN_FRONT = True
+
+# Create temporary non-rendered helper objects:
+#   - a bright marker attached to the render camera
+#   - a square marker showing the current hogel cell
+VISUAL_DEBUG_CREATE_CAMERA_MARKER = True
+VISUAL_DEBUG_CREATE_CELL_MARKER = True
+
+# Camera marker appearance.
+VISUAL_DEBUG_CAMERA_MARKER_RADIUS = 0.10
+VISUAL_DEBUG_CAMERA_MARKER_SEGMENTS = 16
+VISUAL_DEBUG_CAMERA_MARKER_RINGS = 8
+
+# Cell marker appearance.
+VISUAL_DEBUG_CELL_MARKER_SCALE = 0.92  # fraction of cell size
+VISUAL_DEBUG_CELL_MARKER_OFFSET_FACTOR = 0.25  # move slightly off the plane along inward normal
+
+# Force viewport redraws so you can actually see the camera hop.
+VISUAL_DEBUG_REDRAW_ITERATIONS = 1
+
+# Optional pause after moving the camera and before each render.
+# Set to 0.0 if you want minimal slowdown even in debug mode.
+VISUAL_DEBUG_PRE_RENDER_PAUSE_SECONDS = 0.10
+
 
 # ============================================================
 # INTERNAL HELPERS
@@ -192,7 +229,220 @@ def format_seconds(seconds):
     return f"{sec:d}s"
 
 
-def render_hogels(camera_obj, rig):
+def force_viewport_redraw(iterations=1):
+    bpy.context.view_layer.update()
+
+    iterations = max(1, int(iterations))
+    for _ in range(iterations):
+        try:
+            bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+        except RuntimeError:
+            pass
+
+
+def select_only_object(obj):
+    try:
+        bpy.ops.object.select_all(action='DESELECT')
+    except RuntimeError:
+        pass
+
+    obj.select_set(True)
+
+    view_layer = bpy.context.view_layer
+    view_layer.objects.active = obj
+
+
+def set_workspace_status(text):
+    workspace = bpy.context.workspace
+    if workspace is not None:
+        workspace.status_text_set(text)
+
+
+def clear_workspace_status():
+    workspace = bpy.context.workspace
+    if workspace is not None:
+        workspace.status_text_set(None)
+
+
+def make_emission_material(name, color, strength=2.0):
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+
+    for node in list(nodes):
+        nodes.remove(node)
+
+    out_node = nodes.new(type='ShaderNodeOutputMaterial')
+    emission = nodes.new(type='ShaderNodeEmission')
+    emission.inputs['Color'].default_value = color
+    emission.inputs['Strength'].default_value = strength
+    links.new(emission.outputs['Emission'], out_node.inputs['Surface'])
+
+    return mat
+
+
+def create_camera_debug_marker(collection, camera_obj):
+    mesh = bpy.data.meshes.new("Hogel_Debug_Camera_Marker_Mesh")
+    obj = bpy.data.objects.new("Hogel_Debug_Camera_Marker", mesh)
+    collection.objects.link(obj)
+
+    bm_verts = []
+    verts = []
+    faces = []
+
+    # Use Blender operator to create a UV sphere, then copy its mesh.
+    bpy.ops.mesh.primitive_uv_sphere_add(
+        segments=VISUAL_DEBUG_CAMERA_MARKER_SEGMENTS,
+        ring_count=VISUAL_DEBUG_CAMERA_MARKER_RINGS,
+        radius=VISUAL_DEBUG_CAMERA_MARKER_RADIUS,
+        location=(0.0, 0.0, 0.0),
+    )
+    temp = bpy.context.object
+    temp_mesh = temp.data.copy()
+    bpy.data.objects.remove(temp, do_unlink=True)
+
+    obj.data = temp_mesh
+    obj.hide_render = True
+    obj.show_in_front = True
+    obj.parent = camera_obj
+    obj.location = (0.0, 0.0, 0.0)
+
+    mat = make_emission_material(
+        "Hogel_Debug_Camera_Marker_Material",
+        (1.0, 0.2, 0.05, 1.0),
+        strength=3.0,
+    )
+    obj.data.materials.append(mat)
+
+    return obj
+
+
+def create_cell_debug_marker(collection, cell_size):
+    half = 0.5 * cell_size * VISUAL_DEBUG_CELL_MARKER_SCALE
+
+    verts = [
+        (-half, 0.0, -half),
+        ( half, 0.0, -half),
+        ( half, 0.0,  half),
+        (-half, 0.0,  half),
+    ]
+    edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+    ]
+
+    mesh = bpy.data.meshes.new("Hogel_Debug_Cell_Marker_Mesh")
+    mesh.from_pydata(verts, edges, [])
+    mesh.update()
+
+    obj = bpy.data.objects.new("Hogel_Debug_Cell_Marker", mesh)
+    collection.objects.link(obj)
+
+    obj.hide_render = True
+    obj.show_in_front = True
+    obj.display_type = 'WIRE'
+
+    mat = make_emission_material(
+        "Hogel_Debug_Cell_Marker_Material",
+        (1.0, 1.0, 0.0, 1.0),
+        strength=3.0,
+    )
+    obj.data.materials.append(mat)
+
+    return obj
+
+
+def remove_object_if_not_none(obj):
+    if obj is not None and obj.name in bpy.data.objects:
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+
+def setup_visual_debug(rig_collection, camera_obj, rig):
+    state = {
+        "enabled": VISUAL_DEBUG,
+        "camera_debug_marker": None,
+        "cell_debug_marker": None,
+        "camera_display_size_original": camera_obj.data.display_size,
+        "camera_show_name_original": getattr(camera_obj, "show_name", False),
+        "camera_show_in_front_original": getattr(camera_obj, "show_in_front", False),
+        "selected_objects_original": list(bpy.context.selected_objects),
+        "active_object_original": bpy.context.view_layer.objects.active,
+    }
+
+    if not VISUAL_DEBUG:
+        return state
+
+    camera_obj.data.display_size = VISUAL_DEBUG_CAMERA_DISPLAY_SIZE
+    if hasattr(camera_obj, "show_name"):
+        camera_obj.show_name = VISUAL_DEBUG_SHOW_CAMERA_NAME
+    if hasattr(camera_obj, "show_in_front"):
+        camera_obj.show_in_front = VISUAL_DEBUG_SHOW_CAMERA_IN_FRONT
+
+    select_only_object(camera_obj)
+
+    if VISUAL_DEBUG_CREATE_CAMERA_MARKER:
+        state["camera_debug_marker"] = create_camera_debug_marker(rig_collection, camera_obj)
+
+    if VISUAL_DEBUG_CREATE_CELL_MARKER:
+        state["cell_debug_marker"] = create_cell_debug_marker(rig_collection, rig["h"])
+
+    force_viewport_redraw(VISUAL_DEBUG_REDRAW_ITERATIONS)
+    return state
+
+
+def restore_visual_debug(camera_obj, state):
+    if not state.get("enabled", False):
+        return
+
+    remove_object_if_not_none(state.get("camera_debug_marker"))
+    remove_object_if_not_none(state.get("cell_debug_marker"))
+
+    camera_obj.data.display_size = state["camera_display_size_original"]
+    if hasattr(camera_obj, "show_name"):
+        camera_obj.show_name = state["camera_show_name_original"]
+    if hasattr(camera_obj, "show_in_front"):
+        camera_obj.show_in_front = state["camera_show_in_front_original"]
+
+    try:
+        bpy.ops.object.select_all(action='DESELECT')
+    except RuntimeError:
+        pass
+
+    for obj in state["selected_objects_original"]:
+        if obj is not None and obj.name in bpy.data.objects:
+            obj.select_set(True)
+
+    original_active = state["active_object_original"]
+    if original_active is not None and original_active.name in bpy.data.objects:
+        bpy.context.view_layer.objects.active = original_active
+
+    force_viewport_redraw(VISUAL_DEBUG_REDRAW_ITERATIONS)
+
+
+def update_visual_debug_positions(state, center, inward, camera_obj, camera_epsilon):
+    if not state.get("enabled", False):
+        return
+
+    select_only_object(camera_obj)
+
+    cell_marker = state.get("cell_debug_marker")
+    if cell_marker is not None:
+        offset = VISUAL_DEBUG_CELL_MARKER_OFFSET_FACTOR * camera_epsilon * inward
+        cell_marker.location = center + offset
+        cell_marker.rotation_euler = inward.to_track_quat('Y', 'Z').to_euler()
+
+    force_viewport_redraw(VISUAL_DEBUG_REDRAW_ITERATIONS)
+
+    if VISUAL_DEBUG_PRE_RENDER_PAUSE_SECONDS > 0.0:
+        time.sleep(VISUAL_DEBUG_PRE_RENDER_PAUSE_SECONDS)
+        force_viewport_redraw(VISUAL_DEBUG_REDRAW_ITERATIONS)
+
+
+def render_hogels(camera_obj, rig_collection, rig):
     scene = bpy.context.scene
     wm = bpy.context.window_manager
 
@@ -231,8 +481,10 @@ def render_hogels(camera_obj, rig):
     print(f"Grid: Na={na}, Nb={nb}, total={total} hogels")
     print(f"Output directory: {output_dir_abs}")
     print(f"Skip existing: {SKIP_EXISTING}")
+    print(f"Visual debug: {VISUAL_DEBUG}")
     print("")
 
+    visual_state = setup_visual_debug(rig_collection, camera_obj, rig)
     wm.progress_begin(0, total)
 
     try:
@@ -247,13 +499,28 @@ def render_hogels(camera_obj, rig):
                 filename = f"hogel_{i:04d}_{na:04d}_{j:04d}_{nb:04d}.png"
                 filepath = os.path.join(output_dir_abs, filename)
 
+                elapsed = time.time() - start_time
+                avg_time = elapsed / max(count - 1, 1) if count > 1 else 0.0
+                remaining = avg_time * (total - count + 1)
+                percent = 100.0 * count / total if total > 0 else 100.0
+
+                status_prefix = (
+                    f"Hogel render {count}/{total} ({percent:6.2f}%) | "
+                    f"cell=({i+1}/{na}, {j+1}/{nb}) | ETA {format_seconds(remaining)}"
+                )
+
                 if SKIP_EXISTING and os.path.exists(filepath):
                     skipped_count += 1
+                    set_workspace_status(status_prefix + f" | skipping {filename}")
 
-                    elapsed = time.time() - start_time
-                    avg_time = elapsed / count if count > 0 else 0.0
-                    remaining = avg_time * (total - count)
-                    percent = 100.0 * count / total if total > 0 else 100.0
+                    if VISUAL_DEBUG:
+                        update_visual_debug_positions(
+                            visual_state,
+                            center,
+                            inward,
+                            camera_obj,
+                            camera_epsilon,
+                        )
 
                     print(
                         f"[{count:04d}/{total:04d}] "
@@ -267,19 +534,26 @@ def render_hogels(camera_obj, rig):
                     continue
 
                 scene.render.filepath = filepath
-
-                elapsed_before = time.time() - start_time
-                avg_before = elapsed_before / max(count - 1, 1)
-                remaining_before = avg_before * (total - count + 1)
+                set_workspace_status(status_prefix + f" | rendering {filename}")
 
                 print(
                     f"[{count:04d}/{total:04d}] "
                     f"Rendering {filename}  "
-                    f"ETA before render {format_seconds(remaining_before)}",
+                    f"ETA before render {format_seconds(remaining)}",
                     flush=True,
                 )
 
-                bpy.context.view_layer.update()
+                if VISUAL_DEBUG:
+                    update_visual_debug_positions(
+                        visual_state,
+                        center,
+                        inward,
+                        camera_obj,
+                        camera_epsilon,
+                    )
+                else:
+                    bpy.context.view_layer.update()
+
                 bpy.ops.render.render(write_still=True)
 
                 rendered_count += 1
@@ -288,6 +562,11 @@ def render_hogels(camera_obj, rig):
                 avg_time = elapsed / count if count > 0 else 0.0
                 remaining = avg_time * (total - count)
                 percent = 100.0 * count / total if total > 0 else 100.0
+
+                set_workspace_status(
+                    f"Hogel render {count}/{total} ({percent:6.2f}%) | "
+                    f"cell=({i+1}/{na}, {j+1}/{nb}) | ETA {format_seconds(remaining)} | rendered {filename}"
+                )
 
                 print(
                     f"[{count:04d}/{total:04d}] "
@@ -301,11 +580,14 @@ def render_hogels(camera_obj, rig):
 
     finally:
         wm.progress_end()
+        clear_workspace_status()
 
-    # Return the camera to the center of the hologram plane when finished.
-    camera_obj.location = Vector((x0, y0, z0)) + camera_epsilon * inward
-    set_camera_direction(camera_obj, inward)
-    bpy.context.view_layer.update()
+        # Return the camera to the center of the hologram plane when finished.
+        camera_obj.location = Vector((x0, y0, z0)) + camera_epsilon * inward
+        set_camera_direction(camera_obj, inward)
+        bpy.context.view_layer.update()
+
+        restore_visual_debug(camera_obj, visual_state)
 
     total_elapsed = time.time() - start_time
 
@@ -326,7 +608,7 @@ def main():
     rig = read_rig_metadata(rig_collection)
     camera = require_camera(rig["camera_name"])
 
-    render_hogels(camera, rig)
+    render_hogels(camera, rig_collection, rig)
 
 
 main()

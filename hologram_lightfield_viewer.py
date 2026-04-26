@@ -1,5 +1,5 @@
 """
-hologram_lightfield_viewer_fixed_conv8.py
+hologram_lightfield_viewer_fixed_conv8_bilinear_full_tiled.py
 
 Raytraced hogel/light-field viewer.
 
@@ -8,18 +8,20 @@ Important interaction model:
     - The viewer/eye moves around the hologram.
     - The camera always looks at the hologram center.
     - No hologram rotation.
-    - No spatial interpolation.
-    - No bilinear texture filtering.
+    - Bilinear interpolation across neighboring hogels.
+    - Bilinear interpolation within each hogel image, clamped to that hogel.
+    - Tiled atlas textures, so large hogel sets can exceed GL_MAX_TEXTURE_SIZE in total.
 
 For each output pixel:
     1. construct a viewer ray,
     2. intersect it with the fixed hologram plane,
-    3. hit point chooses the hogel,
-    4. incident angle chooses the pixel inside that hogel.
+    3. hit point determines the four neighboring hogels around the hit location,
+    4. incident angle chooses a clamped subpixel location inside each hogel,
+    5. each hogel is sampled bilinearly within its own image,
+    6. the four neighboring hogels are then bilinearly blended.
 
-Convention testing:
-    Hex keys 0-9 and A-F select convention modes 0x0 through 0xF.
-    [ and ] cycle all 16 flip conventions.
+Convention:
+    fixed to mode 0x8, which you found to be correct.
 """
 
 from __future__ import annotations
@@ -138,7 +140,24 @@ void main() {
 
 FRAGMENT_SHADER = r"""#version 330 core
 
-uniform sampler2D u_atlas;
+// The hogel set is split into up to 16 atlas page textures.
+// Each page is a normal 2D texture small enough to respect GL_MAX_TEXTURE_SIZE.
+uniform sampler2D u_page0;
+uniform sampler2D u_page1;
+uniform sampler2D u_page2;
+uniform sampler2D u_page3;
+uniform sampler2D u_page4;
+uniform sampler2D u_page5;
+uniform sampler2D u_page6;
+uniform sampler2D u_page7;
+uniform sampler2D u_page8;
+uniform sampler2D u_page9;
+uniform sampler2D u_page10;
+uniform sampler2D u_page11;
+uniform sampler2D u_page12;
+uniform sampler2D u_page13;
+uniform sampler2D u_page14;
+uniform sampler2D u_page15;
 
 // Viewer camera
 uniform vec3  u_eye;
@@ -163,11 +182,14 @@ uniform float u_screen_height;
 uniform int   u_na;
 uniform int   u_nb;
 
-// Atlas metadata
+// Hogel/page metadata
 uniform float u_hogel_w;
 uniform float u_hogel_h;
-uniform float u_atlas_w;
-uniform float u_atlas_h;
+uniform int   u_page_hogels_x;
+uniform int   u_page_hogels_y;
+uniform int   u_pages_x;
+uniform float u_page_w;
+uniform float u_page_h;
 uniform float u_tan_half_hogel_fov_x;
 uniform float u_tan_half_hogel_fov_y;
 
@@ -183,10 +205,45 @@ uniform vec3  u_bg_color;
 in vec2 v_uv;
 out vec4 f_color;
 
-vec4 sample_hogel_nearest(int i, int j, vec3 ray_dir_world) {
-    if (i < 0 || i >= u_na || j < 0 || j >= u_nb) {
-        return vec4(u_bg_color, 1.0);
-    }
+vec4 sample_page(int layer, vec2 uv) {
+    if (layer == 0)  return texture(u_page0,  uv);
+    if (layer == 1)  return texture(u_page1,  uv);
+    if (layer == 2)  return texture(u_page2,  uv);
+    if (layer == 3)  return texture(u_page3,  uv);
+    if (layer == 4)  return texture(u_page4,  uv);
+    if (layer == 5)  return texture(u_page5,  uv);
+    if (layer == 6)  return texture(u_page6,  uv);
+    if (layer == 7)  return texture(u_page7,  uv);
+    if (layer == 8)  return texture(u_page8,  uv);
+    if (layer == 9)  return texture(u_page9,  uv);
+    if (layer == 10) return texture(u_page10, uv);
+    if (layer == 11) return texture(u_page11, uv);
+    if (layer == 12) return texture(u_page12, uv);
+    if (layer == 13) return texture(u_page13, uv);
+    if (layer == 14) return texture(u_page14, uv);
+    if (layer == 15) return texture(u_page15, uv);
+    return vec4(u_bg_color, 1.0);
+}
+
+vec4 sample_texel_from_hogel(int i, int j, int px, int py) {
+    // Map global hogel coordinates (i,j) into a tiled atlas page.
+    int page_x = i / u_page_hogels_x;
+    int page_y = j / u_page_hogels_y;
+    int layer = page_y * u_pages_x + page_x;
+
+    int local_i = i - page_x * u_page_hogels_x;
+    int local_j = j - page_y * u_page_hogels_y;
+
+    float page_px = float(local_i) * u_hogel_w + float(px) + 0.5;
+    float page_py = float(local_j) * u_hogel_h + float(py) + 0.5;
+
+    vec2 page_uv = vec2(page_px / u_page_w, page_py / u_page_h);
+    return sample_page(layer, page_uv);
+}
+
+vec4 sample_hogel_clamped_bilinear(int i, int j, vec3 ray_dir_world) {
+    i = clamp(i, 0, u_na - 1);
+    j = clamp(j, 0, u_nb - 1);
 
     float d_forward = dot(ray_dir_world, u_holo_forward);
     if (d_forward <= 1.0e-6) {
@@ -206,19 +263,57 @@ vec4 sample_hogel_nearest(int i, int j, vec3 ray_dir_world) {
         v = 1.0 - v;
     }
 
-    if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) {
-        return vec4(u_bg_color, 1.0);
+    // Clamp within each hogel image. Do not reject out-of-range angles.
+    // Then bilinearly interpolate strictly INSIDE this hogel tile only.
+    float x = clamp(u, 0.0, 1.0) * (u_hogel_w - 1.0);
+    float y = clamp(v, 0.0, 1.0) * (u_hogel_h - 1.0);
+
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    int x1 = min(x0 + 1, int(u_hogel_w) - 1);
+    int y1 = min(y0 + 1, int(u_hogel_h) - 1);
+
+    float tx = x - floor(x);
+    float ty = y - floor(y);
+
+    vec4 c00 = sample_texel_from_hogel(i, j, x0, y0);
+    vec4 c10 = sample_texel_from_hogel(i, j, x1, y0);
+    vec4 c01 = sample_texel_from_hogel(i, j, x0, y1);
+    vec4 c11 = sample_texel_from_hogel(i, j, x1, y1);
+
+    vec4 cx0 = mix(c00, c10, tx);
+    vec4 cx1 = mix(c01, c11, tx);
+    return mix(cx0, cx1, ty);
+}
+
+vec4 sample_hogel_bilinear(float cell_x, float cell_y, vec3 ray_dir_world) {
+    // Interpolate between hogel CENTERS, not hogel vertices.
+    float gx = cell_x - 0.5;
+    float gy = cell_y - 0.5;
+
+    if (u_flip_hogel_i != 0) {
+        gx = float(u_na - 1) - gx;
+    }
+    if (u_flip_hogel_j != 0) {
+        gy = float(u_nb - 1) - gy;
     }
 
-    // Strict nearest-pixel sampling inside the chosen hogel.
-    float local_px = floor(clamp(u, 0.0, 0.999999) * u_hogel_w) + 0.5;
-    float local_py = floor(clamp(v, 0.0, 0.999999) * u_hogel_h) + 0.5;
+    int i0 = int(floor(gx));
+    int j0 = int(floor(gy));
+    int i1 = i0 + 1;
+    int j1 = j0 + 1;
 
-    float atlas_px = float(i) * u_hogel_w + local_px;
-    float atlas_py = float(j) * u_hogel_h + local_py;
+    float tx = gx - floor(gx);
+    float ty = gy - floor(gy);
 
-    vec2 atlas_uv = vec2(atlas_px / u_atlas_w, atlas_py / u_atlas_h);
-    return texture(u_atlas, atlas_uv);
+    vec4 c00 = sample_hogel_clamped_bilinear(i0, j0, ray_dir_world);
+    vec4 c10 = sample_hogel_clamped_bilinear(i1, j0, ray_dir_world);
+    vec4 c01 = sample_hogel_clamped_bilinear(i0, j1, ray_dir_world);
+    vec4 c11 = sample_hogel_clamped_bilinear(i1, j1, ray_dir_world);
+
+    vec4 cx0 = mix(c00, c10, tx);
+    vec4 cx1 = mix(c01, c11, tx);
+    return mix(cx0, cx1, ty);
 }
 
 void main() {
@@ -263,20 +358,13 @@ void main() {
         return;
     }
 
-    int i = int(floor((a - u_xmin) / u_h));
-    int j = int(floor((b - u_zmin) / u_h));
+    float cell_x = (a - u_xmin) / u_h;
+    float cell_y = (b - u_zmin) / u_h;
 
-    if (u_flip_hogel_i != 0) {
-        i = u_na - 1 - i;
-    }
-    if (u_flip_hogel_j != 0) {
-        j = u_nb - 1 - j;
-    }
-
-    vec4 col = sample_hogel_nearest(i, j, ray_dir_world);
+    vec4 col = sample_hogel_bilinear(cell_x, cell_y, ray_dir_world);
 
     if (u_show_grid != 0) {
-        vec2 cell = vec2((a - u_xmin) / u_h, (b - u_zmin) / u_h);
+        vec2 cell = vec2(cell_x, cell_y);
         float gx = min(fract(cell.x), 1.0 - fract(cell.x));
         float gz = min(fract(cell.y), 1.0 - fract(cell.y));
 
@@ -315,16 +403,25 @@ class HogelFile:
 
 
 @dataclass
-class HogelAtlas:
+class HogelSet:
     directory: Path
     na: int
     nb: int
     hogel_w: int
     hogel_h: int
-    atlas_w: int
-    atlas_h: int
-    atlas_rgba: np.ndarray
+    files: Dict[Tuple[int, int], Path]
     missing_count: int
+
+
+@dataclass
+class PageInfo:
+    page_hogels_x: int
+    page_hogels_y: int
+    pages_x: int
+    pages_y: int
+    page_count: int
+    page_w: int
+    page_h: int
 
 
 def normalize(v: np.ndarray) -> np.ndarray:
@@ -383,10 +480,17 @@ def discover_hogel_files(directory: Path) -> Tuple[int, int, Dict[Tuple[int, int
     na, nb = next(iter(totals))
     files: Dict[Tuple[int, int], Path] = {}
 
+    duplicates = 0
     for hf in parsed:
         if hf.i < 0 or hf.i >= na or hf.j < 0 or hf.j >= nb:
             raise RuntimeError(f"Out-of-range hogel index in filename: {hf.path.name}")
-        files[(hf.i, hf.j)] = hf.path
+        key = (hf.i, hf.j)
+        if key in files:
+            duplicates += 1
+        files[key] = hf.path
+
+    if duplicates:
+        print(f"Warning: found {duplicates} duplicate hogel indices; using the last one seen.")
 
     return na, nb, files
 
@@ -404,7 +508,11 @@ def validate_hogel_counts_against_params(na: int, nb: int) -> None:
         )
 
 
-def load_hogel_atlas(directory: str) -> HogelAtlas:
+def load_hogel_set(directory: str) -> HogelSet:
+    """
+    Read filenames and image size only. Do NOT build a giant CPU atlas here.
+    Large sets are uploaded later page-by-page as separate GPU textures.
+    """
     directory_path = resolve_hogel_dir(directory)
     na, nb, files = discover_hogel_files(directory_path)
     validate_hogel_counts_against_params(na, nb)
@@ -413,8 +521,6 @@ def load_hogel_atlas(directory: str) -> HogelAtlas:
     with Image.open(first_path) as im:
         hogel_w, hogel_h = im.convert("RGBA").size
 
-    atlas_w = na * hogel_w
-    atlas_h = nb * hogel_h
     expected_count = na * nb
     found_count = len(files)
     missing_count = expected_count - found_count
@@ -424,7 +530,6 @@ def load_hogel_atlas(directory: str) -> HogelAtlas:
     print(f"  directory:     {directory_path}")
     print(f"  Na x Nb:       {na} x {nb} = {expected_count}")
     print(f"  hogel size:    {hogel_w} x {hogel_h}")
-    print(f"  atlas size:    {atlas_w} x {atlas_h}")
     print(f"  files found:   {found_count}")
     print(f"  files missing: {missing_count}")
     print("")
@@ -432,53 +537,13 @@ def load_hogel_atlas(directory: str) -> HogelAtlas:
     if missing_count > 0:
         print("Warning: missing hogels will appear black.")
 
-    # Do not flip on load. The convention keys handle all flips in shader.
-    atlas = np.zeros((atlas_h, atlas_w, 4), dtype=np.uint8)
-
-    loaded = 0
-    t0 = time.time()
-
-    for j in range(nb):
-        for i in range(na):
-            path = files.get((i, j))
-            if path is None:
-                continue
-
-            with Image.open(path) as im:
-                rgba = im.convert("RGBA")
-                if rgba.size != (hogel_w, hogel_h):
-                    raise RuntimeError(
-                        f"Image size mismatch in {path.name}: got {rgba.size}, "
-                        f"expected {(hogel_w, hogel_h)}"
-                    )
-                arr = np.asarray(rgba, dtype=np.uint8)
-
-            x0 = i * hogel_w
-            y0 = j * hogel_h
-            atlas[y0 : y0 + hogel_h, x0 : x0 + hogel_w, :] = arr
-
-            loaded += 1
-            if loaded % LOAD_PROGRESS_EVERY == 0 or loaded == found_count:
-                elapsed = time.time() - t0
-                rate = loaded / elapsed if elapsed > 0 else 0.0
-                print(
-                    f"Loading hogels: {loaded}/{found_count} "
-                    f"({100.0 * loaded / found_count:5.1f}%)  "
-                    f"{rate:6.1f} img/s",
-                    flush=True,
-                )
-
-    print("Done loading hogels into CPU atlas.")
-    print("")
-    return HogelAtlas(
+    return HogelSet(
         directory=directory_path,
         na=na,
         nb=nb,
         hogel_w=hogel_w,
         hogel_h=hogel_h,
-        atlas_w=atlas_w,
-        atlas_h=atlas_h,
-        atlas_rgba=atlas,
+        files=files,
         missing_count=missing_count,
     )
 
@@ -601,52 +666,202 @@ def get_context_int(ctx, name: str, default: Optional[int] = None) -> Optional[i
         return default
 
 
-def upload_atlas_texture(ctx, atlas: HogelAtlas):
-    max_tex = get_context_int(ctx, "GL_MAX_TEXTURE_SIZE")
-    if max_tex is not None:
-        print(f"GPU GL_MAX_TEXTURE_SIZE: {max_tex}")
-        if atlas.atlas_w > max_tex or atlas.atlas_h > max_tex:
-            raise RuntimeError(
-                f"Atlas is too large for this OpenGL context: "
-                f"{atlas.atlas_w} x {atlas.atlas_h}, max texture size {max_tex}."
-            )
+MAX_PAGE_TEXTURES = 16
 
-    print("Uploading atlas to GPU...")
-    t0 = time.time()
-    tex = ctx.texture((atlas.atlas_w, atlas.atlas_h), 4, data=atlas.atlas_rgba)
+
+def choose_page_layout(hogel_set: HogelSet, max_texture_size: int, max_pages: int = MAX_PAGE_TEXTURES) -> PageInfo:
+    max_hogels_x = max_texture_size // hogel_set.hogel_w
+    max_hogels_y = max_texture_size // hogel_set.hogel_h
+
+    if max_hogels_x <= 0 or max_hogels_y <= 0:
+        raise RuntimeError(
+            f"A single hogel image is too large for this OpenGL context. "
+            f"Hogel size is {hogel_set.hogel_w} x {hogel_set.hogel_h}, "
+            f"max texture size is {max_texture_size}."
+        )
+
+    # Minimum number of pages needed in each direction.
+    pages_x = int(math.ceil(hogel_set.na / max_hogels_x))
+    pages_y = int(math.ceil(hogel_set.nb / max_hogels_y))
+
+    # Balance the page sizes. For 150 hogels with max 128 per page, this gives
+    # pages_x=2 and page_hogels_x=75, not 128+22.
+    page_hogels_x = int(math.ceil(hogel_set.na / pages_x))
+    page_hogels_y = int(math.ceil(hogel_set.nb / pages_y))
+
+    page_w = page_hogels_x * hogel_set.hogel_w
+    page_h = page_hogels_y * hogel_set.hogel_h
+    page_count = pages_x * pages_y
+
+    if page_w > max_texture_size or page_h > max_texture_size:
+        raise RuntimeError(
+            f"Internal tiling error: page size {page_w} x {page_h} exceeds "
+            f"GL_MAX_TEXTURE_SIZE={max_texture_size}."
+        )
+
+    if page_count > max_pages:
+        raise RuntimeError(
+            f"This hogel set needs {page_count} atlas pages ({pages_x} x {pages_y}), "
+            f"but this viewer currently supports at most {max_pages} page textures. "
+            f"Reduce hogel count/resolution or increase MAX_PAGE_TEXTURES and the shader sampler list."
+        )
+
+    return PageInfo(
+        page_hogels_x=page_hogels_x,
+        page_hogels_y=page_hogels_y,
+        pages_x=pages_x,
+        pages_y=pages_y,
+        page_count=page_count,
+        page_w=page_w,
+        page_h=page_h,
+    )
+
+
+def make_texture_from_rgba(ctx, rgba: np.ndarray):
+    tex = ctx.texture((rgba.shape[1], rgba.shape[0]), 4, data=rgba)
     tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
     tex.repeat_x = False
     tex.repeat_y = False
-    elapsed = time.time() - t0
-    gib = atlas.atlas_rgba.nbytes / (1024.0 ** 3)
-    print(f"Uploaded {gib:.3f} GiB atlas in {elapsed:.2f} s.")
-    print("")
     return tex
 
 
-def set_static_uniforms(program, atlas: HogelAtlas, screen_width: float, screen_height: float) -> None:
+def upload_tiled_atlas_textures(ctx, hogel_set: HogelSet) -> Tuple[List[object], PageInfo]:
+    max_tex = get_context_int(ctx, "GL_MAX_TEXTURE_SIZE")
+    if max_tex is None:
+        max_tex = 16384
+    print(f"GPU GL_MAX_TEXTURE_SIZE: {max_tex}")
+
+    max_units = get_context_int(ctx, "GL_MAX_TEXTURE_IMAGE_UNITS")
+    if max_units is not None:
+        print(f"GPU GL_MAX_TEXTURE_IMAGE_UNITS: {max_units}")
+        if max_units < MAX_PAGE_TEXTURES:
+            raise RuntimeError(
+                f"This viewer binds {MAX_PAGE_TEXTURES} texture units, but this OpenGL context "
+                f"only reports {max_units}. Reduce MAX_PAGE_TEXTURES and the shader sampler list."
+            )
+
+    page_info = choose_page_layout(hogel_set, max_tex)
+
+    print("")
+    print("Tiled atlas layout")
+    print(f"  pages:          {page_info.pages_x} x {page_info.pages_y} = {page_info.page_count}")
+    print(f"  hogels/page:    {page_info.page_hogels_x} x {page_info.page_hogels_y}")
+    print(f"  page texture:   {page_info.page_w} x {page_info.page_h}")
+    print(f"  total GPU data: {(hogel_set.na * hogel_set.nb * hogel_set.hogel_w * hogel_set.hogel_h * 4) / (1024.0 ** 3):.3f} GiB")
+    print("")
+
+    page_textures: List[object] = []
+    total_loaded = 0
+    total_expected = hogel_set.na * hogel_set.nb - hogel_set.missing_count
+    t_all = time.time()
+
+    for page_y in range(page_info.pages_y):
+        for page_x in range(page_info.pages_x):
+            layer = page_y * page_info.pages_x + page_x
+            print(f"Building atlas page {layer + 1}/{page_info.page_count} ({page_x}, {page_y})...", flush=True)
+
+            page_rgba = np.zeros((page_info.page_h, page_info.page_w, 4), dtype=np.uint8)
+            page_loaded = 0
+            t_page = time.time()
+
+            for local_j in range(page_info.page_hogels_y):
+                global_j = page_y * page_info.page_hogels_y + local_j
+                if global_j >= hogel_set.nb:
+                    continue
+
+                for local_i in range(page_info.page_hogels_x):
+                    global_i = page_x * page_info.page_hogels_x + local_i
+                    if global_i >= hogel_set.na:
+                        continue
+
+                    path = hogel_set.files.get((global_i, global_j))
+                    if path is None:
+                        continue
+
+                    with Image.open(path) as im:
+                        rgba = im.convert("RGBA")
+                        if rgba.size != (hogel_set.hogel_w, hogel_set.hogel_h):
+                            raise RuntimeError(
+                                f"Image size mismatch in {path.name}: got {rgba.size}, "
+                                f"expected {(hogel_set.hogel_w, hogel_set.hogel_h)}"
+                            )
+                        arr = np.asarray(rgba, dtype=np.uint8)
+
+                    x0 = local_i * hogel_set.hogel_w
+                    y0 = local_j * hogel_set.hogel_h
+                    page_rgba[y0 : y0 + hogel_set.hogel_h, x0 : x0 + hogel_set.hogel_w, :] = arr
+
+                    page_loaded += 1
+                    total_loaded += 1
+
+                    if total_loaded % LOAD_PROGRESS_EVERY == 0 or total_loaded == total_expected:
+                        elapsed = time.time() - t_all
+                        rate = total_loaded / elapsed if elapsed > 0 else 0.0
+                        print(
+                            f"Loading/uploading hogels: {total_loaded}/{total_expected} "
+                            f"({100.0 * total_loaded / max(total_expected, 1):5.1f}%)  "
+                            f"{rate:6.1f} img/s",
+                            flush=True,
+                        )
+
+            print(
+                f"Uploading page {layer + 1}/{page_info.page_count}: "
+                f"{page_loaded} hogels, {page_rgba.nbytes / (1024.0 ** 3):.3f} GiB...",
+                flush=True,
+            )
+            tex = make_texture_from_rgba(ctx, page_rgba)
+            page_textures.append(tex)
+            del page_rgba
+
+            elapsed_page = time.time() - t_page
+            print(f"Page {layer + 1}/{page_info.page_count} done in {elapsed_page:.2f} s.", flush=True)
+
+    # Bind dummy 1x1 textures to any unused sampler units so all shader sampler
+    # uniforms are valid even though only page_count are actually sampled.
+    dummy_rgba = np.zeros((1, 1, 4), dtype=np.uint8)
+    dummy_rgba[0, 0, 3] = 255
+    dummy = make_texture_from_rgba(ctx, dummy_rgba)
+    while len(page_textures) < MAX_PAGE_TEXTURES:
+        page_textures.append(dummy)
+
+    total_elapsed = time.time() - t_all
+    print("")
+    print(f"Finished uploading tiled atlas pages in {total_elapsed:.2f} s.")
+    print("")
+
+    return page_textures, page_info
+
+
+def set_static_uniforms(program, hogel_set: HogelSet, screen_width: float, screen_height: float, page_info: PageInfo) -> None:
     h = float(HOGEL_CELL_SIZE)
     xmin = -screen_width / 2.0
     zmin = -screen_height / 2.0
 
     fov_x = math.radians(HOGEL_FOV_X_DEGREES)
-    aspect = atlas.hogel_w / atlas.hogel_h
+    aspect = hogel_set.hogel_w / hogel_set.hogel_h
     fov_y = 2.0 * math.atan(math.tan(fov_x / 2.0) / aspect)
 
     right, forward, up = fixed_hologram_axes()
 
-    program["u_atlas"].value = 0
+    for idx in range(MAX_PAGE_TEXTURES):
+        uniform_name = f"u_page{idx}"
+        if uniform_name in program:
+            program[uniform_name].value = idx
+
     program["u_xmin"].value = xmin
     program["u_zmin"].value = zmin
     program["u_h"].value = h
     program["u_screen_width"].value = float(screen_width)
     program["u_screen_height"].value = float(screen_height)
-    program["u_na"].value = atlas.na
-    program["u_nb"].value = atlas.nb
-    program["u_hogel_w"].value = float(atlas.hogel_w)
-    program["u_hogel_h"].value = float(atlas.hogel_h)
-    program["u_atlas_w"].value = float(atlas.atlas_w)
-    program["u_atlas_h"].value = float(atlas.atlas_h)
+    program["u_na"].value = hogel_set.na
+    program["u_nb"].value = hogel_set.nb
+    program["u_hogel_w"].value = float(hogel_set.hogel_w)
+    program["u_hogel_h"].value = float(hogel_set.hogel_h)
+    program["u_page_hogels_x"].value = int(page_info.page_hogels_x)
+    program["u_page_hogels_y"].value = int(page_info.page_hogels_y)
+    program["u_pages_x"].value = int(page_info.pages_x)
+    program["u_page_w"].value = float(page_info.page_w)
+    program["u_page_h"].value = float(page_info.page_h)
     program["u_tan_half_hogel_fov_x"].value = math.tan(fov_x / 2.0)
     program["u_tan_half_hogel_fov_y"].value = math.tan(fov_y / 2.0)
     program["u_bg_color"].value = BACKGROUND_RGB
@@ -666,7 +881,8 @@ def set_static_uniforms(program, atlas: HogelAtlas, screen_width: float, screen_
     print(f"  hogel right/up:      {tuple(float(v) for v in right)} / {tuple(float(v) for v in up)}")
     print(f"  hogel FOV x/y:       {math.degrees(fov_x):.3f} / {math.degrees(fov_y):.3f} deg")
     print("  hologram pose:       FIXED, viewer orbits/moves")
-    print("  sampling:            nearest hogel, nearest hogel pixel, no interpolation")
+    print("  sampling:            bilinear across neighboring hogels and bilinear within each hogel image")
+    print("  atlas:               tiled 2D page textures")
     print("")
 
 
@@ -708,7 +924,7 @@ def print_controls() -> None:
     print("  Shift            move/orbit faster")
     print("  R                reset viewer")
     print("  G                toggle cell grid overlay")
-    print("  0-9, A-F         select convention mode 0x0 through 0xF")
+    print("  convention       fixed to 0x8")
     print("  Esc              quit")
     print("")
 
@@ -730,22 +946,23 @@ def main() -> None:
 
     flags = pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
     pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), flags)
-    pygame.display.set_caption("Hogel / Light-Field Viewer - fixed convention 0x8")
+    pygame.display.set_caption("Hogel / Light-Field Viewer - fixed convention 0x8 - tiled full bilinear")
 
     ctx = moderngl.create_context()
     ctx.disable(moderngl.DEPTH_TEST)
     ctx.disable(moderngl.CULL_FACE)
 
-    atlas = load_hogel_atlas(HOGEL_DIR)
+    hogel_set = load_hogel_set(HOGEL_DIR)
 
-    screen_width = atlas.na * HOGEL_CELL_SIZE
-    screen_height = atlas.nb * HOGEL_CELL_SIZE
+    screen_width = hogel_set.na * HOGEL_CELL_SIZE
+    screen_height = hogel_set.nb * HOGEL_CELL_SIZE
 
-    atlas_tex = upload_atlas_texture(ctx, atlas)
-    atlas_tex.use(location=0)
+    page_textures, page_info = upload_tiled_atlas_textures(ctx, hogel_set)
+    for unit, tex in enumerate(page_textures):
+        tex.use(location=unit)
 
     program = ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
-    set_static_uniforms(program, atlas, screen_width, screen_height)
+    set_static_uniforms(program, hogel_set, screen_width, screen_height, page_info)
 
     quad = make_fullscreen_quad()
     vbo = ctx.buffer(quad.tobytes())
@@ -827,7 +1044,8 @@ def main() -> None:
         program["u_view_aspect"].value = width / height
 
         ctx.clear(*BACKGROUND_RGB, 1.0)
-        atlas_tex.use(location=0)
+        for unit, tex in enumerate(page_textures):
+            tex.use(location=unit)
         vao.render(moderngl.TRIANGLES)
 
         pygame.display.flip()
@@ -837,7 +1055,7 @@ def main() -> None:
             fps = clock.get_fps()
             grid = "grid" if SHOW_CELL_GRID_OVERLAY else "no-grid"
             pygame.display.set_caption(
-                f"Hogel Viewer | fixed hologram, orbit viewer | {fps:5.1f} FPS | "
+                f"Hogel Viewer | fixed hologram, orbit viewer | tiled full bilinear | {fps:5.1f} FPS | "
                 f"{grid} | convention 0x{current_convention_index:X} | "
                 f"eye=({eye[0]:.2f}, {eye[1]:.2f}, {eye[2]:.2f}) | "
                 f"radius={camera.radius:.2f}"

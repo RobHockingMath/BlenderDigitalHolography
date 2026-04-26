@@ -9,4 +9,6 @@ to just look at the folder "hogel_renders" that the images are being written to.
 
 You can then preview what your hologram should look like by running from the terminal "python hologram_lightfield_viewer.py".  Run "pip install pygame moderngl pillow numpy" from the terminal to make sure you have everything.
 
+Edit the values in hogel_params.py to adjust the size and placement of your hologram plane relative to your Blender scene, and to control the size of the hogels.  Right now I assume the hologram plane lies in the xz-plane at a constant y value, but this is easy to change later.  You can also adjust the field of view of your hogels, and the size of your hogel images here.  Right now I've made the horizontal and vertical field of view the same, but this is also easy to change.
+
 IN ITS CURRENT FORM, THIS ONLY WORKS IF THE ENTIRE SCENE IS BEHIND THE HOLOGRAM PLANE.

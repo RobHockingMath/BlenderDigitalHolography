@@ -2,7 +2,9 @@ How to use:
 
 If you already have a blender scene, load and run the "create_hogel_lightfield_rig.py" script to add the hogel image rendering rig into the scene.  If you don't have a scene, load and run "create_rubiks_cube.py" to create one.  
 
-Edit the values in hogel_params.py to adjust the size and placement of your hologram plane relative to your Blender scene, and to control the size of the hogels.  Right now I assume the hologram plane lies in the xz-plane at a constant y value, but this is easy to change later.  You can also adjust the field of view of your hogels, and the size of your hogel images here.  Right now I've made the horizontal and vertical field of view the same, but this is also easy to change.
+Edit the values in hogel_params.py to adjust the size and placement of your hologram plane relative to your Blender scene, and to control the size of the hogels.  Right now I assume the hologram plane lies in the xz-plane at a constant y value, but this is easy to change later.  You can also adjust the field of view of your hogels - right now I've made the horizontal and vertical field of view the same, but this is also easy to change.
+
+The size of your hogel images can be adjusted in render_hogels_from_rig.py.
 
 Then, load and run the render_hogels_from_rig.py script to start rendering hogel images.  This might take quite some time, depending on scene complexity and the number of hogels.  Rather than measuring progress within Blender, I find it easier
 to just look at the folder "hogel_renders" that the images are being written to.  Periodically check how many files are in it (there will be one per hogel, so compute ahead of time how many hogels you have).  
